@@ -1,4 +1,4 @@
-# Trojan Proxy Server with UDP Support
+# Trojan GFW Proxy Server with UDP Support
 
 A Rust implementation of a Trojan proxy server that supports both TCP and UDP traffic over TLS, with fallback capabilities for legitimate HTTPS traffic.
 
