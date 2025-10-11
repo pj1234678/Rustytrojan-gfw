@@ -187,12 +187,10 @@ async fn handle_udp_associate(
     // Channel for sending responses back to client
     let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     
-    // Clone socket for the UDP receiver task
+    // --- FIX: Save the JoinHandle for the UDP receiver task ---
     let socket_clone = Arc::clone(&udp_socket);
     let response_tx_clone = response_tx.clone();
-    
-    // Task to handle incoming UDP responses
-    tokio::spawn(async move {
+    let udp_receiver_handle = tokio::spawn(async move {
         let mut buf = [0u8; BUFFER_SIZE];
         loop {
             match socket_clone.recv_from(&mut buf).await {
@@ -201,7 +199,7 @@ async fn handle_udp_associate(
                     let port = addr.port();
                     let payload = &buf[..len];
                     
-                    println!("INFO: UDP response from {}:{}, {} bytes", addr_str, port, len);
+                    // println!("INFO: UDP response from {}:{}, {} bytes", addr_str, port, len);
                     
                     match encode_udp_response(&addr_str, port, payload) {
                         Ok(response) => {
@@ -216,7 +214,10 @@ async fn handle_udp_associate(
                     }
                 }
                 Err(e) => {
-                    println!("ERROR: UDP socket error: {}", e);
+                    // This error is expected when the socket is closed.
+                    if e.kind() != std::io::ErrorKind::ConnectionReset {
+                         println!("ERROR: UDP socket error: {}", e);
+                    }
                     break;
                 }
             }
@@ -228,8 +229,8 @@ async fn handle_udp_associate(
     // Split stream for concurrent read/write
     let (mut read_half, mut write_half) = tokio::io::split(client_stream);
     
-    // Task to send UDP responses back to client
-    tokio::spawn(async move {
+    // --- FIX: Save the JoinHandle for the TCP writer task ---
+    let tcp_writer_handle = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
             if write_half.write_all(&response).await.is_err() {
                 break;
@@ -242,15 +243,13 @@ async fn handle_udp_associate(
         // Process all complete packets in buffer
         while !buffer.is_empty() {
             if let Some((dest_addr, dest_port, payload, packet_size)) = parse_udp_packet(&buffer) {
-                println!("INFO: UDP relay to {}:{}, {} bytes", dest_addr, dest_port, payload.len());
+                // println!("INFO: UDP relay to {}:{}, {} bytes", dest_addr, dest_port, payload.len());
                 
-                // Send UDP packet to destination
-                let dest_addr = format!("{}:{}", dest_addr, dest_port);
-                if let Err(e) = udp_socket.send_to(&payload, &dest_addr).await {
-                    println!("ERROR: Failed to send UDP packet to {}: {}", dest_addr, e);
+                let dest_full_addr = format!("{}:{}", dest_addr, dest_port);
+                if let Err(e) = udp_socket.send_to(&payload, &dest_full_addr).await {
+                    println!("ERROR: Failed to send UDP packet to {}: {}", dest_full_addr, e);
                 }
                 
-                // Remove processed packet from buffer
                 buffer.drain(..packet_size);
             } else {
                 break; // Incomplete packet, need more data
@@ -270,6 +269,11 @@ async fn handle_udp_associate(
     }
     
     println!("INFO: Closing UDP tunnel");
+
+    // --- FIX: Abort the spawned tasks to ensure they terminate and release resources ---
+    udp_receiver_handle.abort();
+    tcp_writer_handle.abort();
+    
     Ok(())
 }
 
