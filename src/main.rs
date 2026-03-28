@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,6 +5,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tokio_rustls::{rustls, TlsAcceptor};
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile;
@@ -13,9 +13,8 @@ use rustls_pemfile;
 use sha2::{Digest, Sha224};
 
 // --- Configuration ---
-const PASSWORD: &str = "your_password_here";
-const FALLBACK_HOST: &str = "http://google.com";
-const FALLBACK_PORT: u16 = 80;
+const BACKEND_ADDR: &str = "127.0.0.1:80";
+const MAX_CONNECTIONS: usize = 512;
 const LISTEN_HOST: &str = "0.0.0.0";
 const LISTEN_PORT: u16 = 443;
 const CERT_FILE: &str = "server.crt";
@@ -23,30 +22,6 @@ const KEY_FILE: &str = "server.key";
 const BUFFER_SIZE: usize = 4096;
 // ---------------------
 
-#[derive(Debug)]
-enum TrojanCommand {
-    Connect = 0x01,
-    UdpAssociate = 0x03,
-}
-
-#[derive(Debug)]
-enum AddressType {
-    IPv4 = 0x01,
-    Domain = 0x03,
-    IPv6 = 0x04,
-}
-
-#[derive(Debug, Clone)]
-struct UdpPacket {
-    addr: String,
-    port: u16,
-    payload: Vec<u8>,
-}
-
-struct UdpSession {
-    socket: Arc<UdpSocket>,
-    client_tx: mpsc::UnboundedSender<Vec<u8>>,
-}
 
 fn sha224_hex(s: &str) -> String {
     let mut hasher = Sha224::new();
@@ -172,201 +147,268 @@ fn encode_udp_response(addr: &str, port: u16, payload: &[u8]) -> Result<Vec<u8>,
     
     Ok(response)
 }
-
+use std::collections::HashSet;
+use std::sync::RwLock;
 async fn handle_udp_associate(
     mut client_stream: tokio_rustls::server::TlsStream<TcpStream>,
     initial_payload: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Create UDP socket for this session
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let local_port = udp_socket.local_addr()?.port();
-    let udp_socket = Arc::new(udp_socket);
-    
-    println!("INFO: UDP associate endpoint created on port {}", local_port);
-    
-    // Channel for sending responses back to client
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    
-    // --- FIX: Save the JoinHandle for the UDP receiver task ---
-    let socket_clone = Arc::clone(&udp_socket);
-    let response_tx_clone = response_tx.clone();
-    let udp_receiver_handle = tokio::spawn(async move {
-        let mut buf = [0u8; BUFFER_SIZE];
-        loop {
-            match socket_clone.recv_from(&mut buf).await {
-                Ok((len, addr)) => {
-                    let addr_str = addr.ip().to_string();
-                    let port = addr.port();
-                    let payload = &buf[..len];
-                    
-                    // println!("INFO: UDP response from {}:{}, {} bytes", addr_str, port, len);
-                    
-                    match encode_udp_response(&addr_str, port, payload) {
-                        Ok(response) => {
-                            if response_tx_clone.send(response).is_err() {
-                                break; // Client disconnected
-                            }
-                        }
-                        Err(e) => {
-                            println!("ERROR: Error encoding UDP response: {}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    // This error is expected when the socket is closed.
-                    if e.kind() != std::io::ErrorKind::ConnectionReset {
-                         println!("ERROR: UDP socket error: {}", e);
-                    }
-                    break;
-                }
-            }
-        }
-    });
-    
-    let mut buffer = initial_payload;
-    
-    // Split stream for concurrent read/write
+    println!("INFO: UDP associate endpoint created on port {}", udp_socket.local_addr()?.port());
+
+    // Single-threaded state: No RwLocks or Channels needed anymore!
+    let mut allowed_peers = HashSet::new();
+    let mut tcp_buffer = initial_payload;
+    let mut temp_tcp_buf = [0u8; BUFFER_SIZE];
+    let mut udp_buf = [0u8; BUFFER_SIZE];
+
     let (mut read_half, mut write_half) = tokio::io::split(client_stream);
-    
-    // --- FIX: Save the JoinHandle for the TCP writer task ---
-    let tcp_writer_handle = tokio::spawn(async move {
-        while let Some(response) = response_rx.recv().await {
-            if write_half.write_all(&response).await.is_err() {
-                break;
-            }
-        }
-    });
-    
-    // Main loop to process UDP packets from client
+
+    // Set our 5-minute idle timeout timer
+    let timeout_duration = Duration::from_secs(300);
+    let sleep_future = sleep(timeout_duration);
+    tokio::pin!(sleep_future); // Pin the timer so we can reset it in the loop
+
     loop {
-        // Process all complete packets in buffer
-        while !buffer.is_empty() {
-            if let Some((dest_addr, dest_port, payload, packet_size)) = parse_udp_packet(&buffer) {
-                // println!("INFO: UDP relay to {}:{}, {} bytes", dest_addr, dest_port, payload.len());
+        tokio::select! {
+            // ========================================================
+            // EVENT 1: Data arrives from the client over TCP
+            // ========================================================
+            tcp_result = read_half.read(&mut temp_tcp_buf) => {
+                let n = match tcp_result {
+                    Ok(0) => break, // Client closed TCP connection naturally
+                    Ok(n) => n,
+                    Err(e) => {
+                        println!("ERROR: TCP read error in UDP associate: {}", e);
+                        break;
+                    }
+                };
                 
-                let dest_full_addr = format!("{}:{}", dest_addr, dest_port);
-                if let Err(e) = udp_socket.send_to(&payload, &dest_full_addr).await {
-                    println!("ERROR: Failed to send UDP packet to {}: {}", dest_full_addr, e);
+                tcp_buffer.extend_from_slice(&temp_tcp_buf[..n]);
+
+                // Process all fully framed UDP packets in the buffer
+                while !tcp_buffer.is_empty() {
+                    if let Some((dest_addr, dest_port, payload, packet_size)) = parse_udp_packet(&tcp_buffer) {
+                        let dest_full_addr = format!("{}:{}", dest_addr, dest_port);
+
+                        match tokio::net::lookup_host(&dest_full_addr).await {
+                            Ok(mut addrs) => {
+                                if let Some(target_addr) = addrs.next() {
+                                    // Trust this target IP to reply to us later
+                                    allowed_peers.insert(target_addr);
+                                    
+                                    if let Err(e) = udp_socket.send_to(&payload, target_addr).await {
+                                        println!("WARN: Failed to forward UDP to {}: {}", target_addr, e);
+                                    }
+                                }
+                            }
+                            Err(e) => println!("WARN: UDP DNS resolution failed for {}: {}", dest_full_addr, e),
+                        }
+                        // Remove the processed packet from the buffer
+                        tcp_buffer.drain(..packet_size);
+                    } else {
+                        break; // Incomplete packet, wait for more TCP data
+                    }
                 }
-                
-                buffer.drain(..packet_size);
-            } else {
-                break; // Incomplete packet, need more data
+
+                // Reset our idle timeout since we saw client activity
+                sleep_future.as_mut().reset(Instant::now() + timeout_duration);
             }
-        }
-        
-        // Read more data from client
-        let mut temp_buf = [0u8; BUFFER_SIZE];
-        match read_half.read(&mut temp_buf).await {
-            Ok(0) => break, // Client disconnected
-            Ok(n) => buffer.extend_from_slice(&temp_buf[..n]),
-            Err(e) => {
-                println!("ERROR: Error reading from client: {}", e);
+
+            // ========================================================
+            // EVENT 2: Data arrives from the target over UDP
+            // ========================================================
+            udp_result = udp_socket.recv_from(&mut udp_buf) => {
+                match udp_result {
+                    Ok((len, addr)) => {
+                        // Ensure this packet is from a server the client actually requested
+                        if allowed_peers.contains(&addr) {
+                            let payload = &udp_buf[..len];
+                            
+                            match encode_udp_response(&addr.ip().to_string(), addr.port(), payload) {
+                                Ok(response) => {
+                                    if let Err(e) = write_half.write_all(&response).await {
+                                        println!("ERROR: Failed to write UDP response to TCP client: {}", e);
+                                        break; // Client disconnected unexpectedly
+                                    }
+                                }
+                                Err(e) => println!("ERROR: Failed to encode UDP response: {}", e),
+                            }
+                        } else {
+                            println!("WARN: Dropped unexpected UDP packet from {}", addr);
+                        }
+                    }
+                    Err(e) => {
+                        println!("ERROR: UDP socket read error: {}", e);
+                        break;
+                    }
+                }
+
+                // Reset our idle timeout since we saw target activity
+                sleep_future.as_mut().reset(Instant::now() + timeout_duration);
+            }
+
+            // ========================================================
+            // EVENT 3: The 5-minute idle timer expires
+            // ========================================================
+            () = &mut sleep_future => {
+                println!("INFO: UDP session timed out after 5 minutes of inactivity.");
                 break;
             }
         }
     }
-    
-    println!("INFO: Closing UDP tunnel");
 
-    // --- FIX: Abort the spawned tasks to ensure they terminate and release resources ---
-    udp_receiver_handle.abort();
-    tcp_writer_handle.abort();
-    
+    println!("INFO: Closing UDP tunnel cleanly.");
     Ok(())
+}
+use tokio::time::{sleep, Instant};
+
+fn is_private_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()           // 127.0.0.0/8
+            || ipv4.is_private()         // 10/8, 172.16/12, 192.168/16
+            || ipv4.is_link_local()      // 169.254.0.0/16
+            || ipv4.is_broadcast()       // 255.255.255.255
+            || ipv4.is_documentation()   // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+            || ipv4.is_unspecified()     // 0.0.0.0
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()           // ::1
+            || ipv6.is_unspecified()     // ::
+            // ULA: fc00::/7
+            || (ipv6.segments()[0] & 0xfe00) == 0xfc00
+            // Link-local: fe80::/10
+            || (ipv6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 async fn handle_tcp_connect(
-    mut client_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    client_stream: tokio_rustls::server::TlsStream<TcpStream>,
     addr: String,
     port: u16,
     initial_data: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connect to target server
+    // Block reserved/privileged ports
+    if port == 0 {
+        println!("WARN: SSRF block: rejecting request to port 0");
+        return Err("Blocked port".into());
+    }
+
     let target_addr = format!("{}:{}", addr, port);
-    let mut target_stream = match TcpStream::connect(&target_addr).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            println!("ERROR: Failed to connect to {}: {}", target_addr, e);
+
+    // Resolve the hostname before connecting so we can inspect the IP
+    let mut resolved = match timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host(&target_addr)
+    ).await {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(e)) => {
+            println!("WARN: DNS resolution failed for {}: {}", target_addr, e);
             return Err(Box::new(e));
         }
+        Err(_) => {
+            println!("WARN: DNS resolution timed out for {}", target_addr);
+            return Err("DNS timeout".into());
+        }
     };
-    
-    println!("INFO: TCP tunnel established to {}", target_addr);
-    
-    // Send initial data if present
+
+    let target_socket_addr = match resolved.next() {
+        Some(addr) => addr,
+        None => {
+            println!("WARN: DNS returned no addresses for {}", target_addr);
+            return Err("No addresses resolved".into());
+        }
+    };
+
+    // SSRF check: block private/loopback/link-local addresses
+    if is_private_address(target_socket_addr.ip()) {
+        println!(
+            "WARN: SSRF block: {} resolved to private address {} - rejecting",
+            addr, target_socket_addr.ip()
+        );
+        return Err("Blocked private address".into());
+    }
+
+    // Now connect using the already-resolved SocketAddr, not the hostname,
+    // to prevent DNS rebinding between resolution and connect
+    let mut target_stream = match timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(target_socket_addr)
+    ).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            println!("ERROR: Failed to connect to {}: {}", target_socket_addr, e);
+            return Err(Box::new(e));
+        }
+        Err(_) => {
+            println!("WARN: Connection to {} timed out", target_socket_addr);
+            return Err("TCP connect timeout".into());
+        }
+    };
+
     if !initial_data.is_empty() {
         target_stream.write_all(&initial_data).await?;
     }
-    
-    // Start bidirectional relay
+
     let (client_read, client_write) = tokio::io::split(client_stream);
     let (target_read, target_write) = tokio::io::split(target_stream);
-    
-    let client_to_target = pipe_data(client_read, target_write);
-    let target_to_client = pipe_data(target_read, client_write);
-    
-    // Wait for either direction to complete
+
     tokio::select! {
-        result1 = client_to_target => {
+        result1 = pipe_data(client_read, target_write) => {
             if let Err(e) = result1 {
                 println!("ERROR: Client to target pipe error: {}", e);
             }
         }
-        result2 = target_to_client => {
+        result2 = pipe_data(target_read, client_write) => {
             if let Err(e) = result2 {
                 println!("ERROR: Target to client pipe error: {}", e);
             }
         }
     }
-    
+
     Ok(())
 }
-
+use chrono::Utc;
 async fn fallback_proxy(
-    mut client_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    client_stream: tokio_rustls::server::TlsStream<TcpStream>,
     initial_data: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("INFO: Fallback: proxying traffic to {}:{}", FALLBACK_HOST, FALLBACK_PORT);
-    
-    let fallback_addr = format!("{}:{}", FALLBACK_HOST, FALLBACK_PORT);
-    let mut fallback_stream = match TcpStream::connect(&fallback_addr).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            println!("ERROR: Failed to connect to fallback {}: {}", fallback_addr, e);
+    let mut backend = match timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(BACKEND_ADDR)
+    ).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            println!("ERROR: Failed to connect to backend {}: {}", BACKEND_ADDR, e);
             return Err(Box::new(e));
         }
+        Err(_) => {
+            println!("ERROR: Backend connection timed out");
+            return Err("Backend timeout".into());
+        }
     };
-    
-    // Send initial data
+
+    // Replay any bytes we already read from the client
     if !initial_data.is_empty() {
-        fallback_stream.write_all(&initial_data).await?;
+        backend.write_all(&initial_data).await?;
     }
-    
-    // Start bidirectional relay
+
     let (client_read, client_write) = tokio::io::split(client_stream);
-    let (fallback_read, fallback_write) = tokio::io::split(fallback_stream);
-    
-    let client_to_fallback = pipe_data(client_read, fallback_write);
-    let fallback_to_client = pipe_data(fallback_read, client_write);
-    
+    let (backend_read, backend_write) = tokio::io::split(backend);
+
     tokio::select! {
-        result1 = client_to_fallback => {
-            if let Err(e) = result1 {
-                println!("ERROR: Client to fallback pipe error: {}", e);
-            }
+        result1 = pipe_data(client_read, backend_write) => {
+            if let Err(e) = result1 { println!("ERROR: Client to backend pipe error: {}", e); }
         }
-        result2 = fallback_to_client => {
-            if let Err(e) = result2 {
-                println!("ERROR: Fallback to client pipe error: {}", e);
-            }
+        result2 = pipe_data(backend_read, client_write) => {
+            if let Err(e) = result2 { println!("ERROR: Backend to client pipe error: {}", e); }
         }
     }
-    
+
     Ok(())
 }
-
 async fn pipe_data<R, W>(mut reader: R, mut writer: W) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -392,50 +434,109 @@ where
     }
     Ok(())
 }
+use tokio::time::timeout;
+use std::sync::OnceLock;
+static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
 
-async fn handle_client(stream: TcpStream, tls_acceptor: TlsAcceptor) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn init_password_hash(password: &str) {
+    PASSWORD_HASH.get_or_init(|| sha224_hex(password));
+}
+
+fn get_password_hash() -> &'static str {
+    PASSWORD_HASH.get().expect("Password hash not initialized")
+}// ---------------------------------------------------------
+
+async fn handle_client(
+    stream: TcpStream, 
+    tls_acceptor: TlsAcceptor
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_addr = stream.peer_addr()?;
-    println!("INFO: New connection from {}", client_addr);
+    //println!("INFO: New connection from {}", client_addr);
     
-    // Establish TLS connection
-    let mut tls_stream = match tls_acceptor.accept(stream).await {
-        Ok(stream) => stream,
-        Err(e) => {
+    // --- SEC FIX: TLS Handshake Timeout (Slowloris Protection) ---
+    // Unauthenticated clients can no longer hold open connections indefinitely 
+    // simply by withholding the TLS ClientHello packet.
+    let mut tls_stream = match timeout(Duration::from_secs(10), tls_acceptor.accept(stream)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
             println!("ERROR: TLS handshake failed for {}: {}", client_addr, e);
             return Err(Box::new(e));
         }
+        Err(_) => {
+            println!("WARN: TLS handshake timed out for {}", client_addr);
+            return Err("TLS handshake timeout".into());
+        }
     };
+    // -------------------------------------------------------------
     
-    // Read initial data
-    let mut initial_buf = [0u8; BUFFER_SIZE];
-    let n = tls_stream.read(&mut initial_buf).await?;
-    let data = &initial_buf[..n];
+    let mut initial_buf = Vec::new();
+    let mut temp_buf = [0u8; BUFFER_SIZE];
     
-    if data.len() < 58 {
-        println!("WARN: Handshake failed: packet too short. Fallback.");
-        return fallback_proxy(tls_stream, data.to_vec()).await;
+    // Nginx default client_header_timeout is typically 60 seconds.
+    let read_result = timeout(Duration::from_secs(60), async {
+        loop {
+            let n = tls_stream.read(&mut temp_buf).await?;
+            if n == 0 {
+                break; // EOF (Client closed connection)
+            }
+            initial_buf.extend_from_slice(&temp_buf[..n]);
+            
+            // Condition 1: We have enough data to evaluate a Trojan handshake
+            if initial_buf.len() >= 58 {
+                break;
+            }
+            
+            // Condition 2: Early HTTP Probe Detection
+            if initial_buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    }).await;
+
+    // Handle timeout, connection errors, or explicitly invalid Trojan lengths/HTTP requests
+    if read_result.is_err() || initial_buf.len() < 58 {
+        println!("INFO: Routing suspicious probe or HTTP request to fallback.");
+        return fallback_proxy(tls_stream, initial_buf).await; 
     }
     
-    // Authenticate
-    let expected_hash = sha224_hex(PASSWORD);
+    let data = &initial_buf;
+    
+    // --- SEC FIX: Use the globally cached hash ---
+    let expected_hash = get_password_hash();
+    // ---------------------------------------------
+
     let received_hash = match std::str::from_utf8(&data[..56]) {
         Ok(hash) => hash,
         Err(_) => {
-            println!("WARN: Handshake failed: invalid hash format. Fallback.");
-            return fallback_proxy(tls_stream, data.to_vec()).await;
+            println!("INFO: Invalid hash encoding. Routing to fallback.");
+            return fallback_proxy(tls_stream, initial_buf).await; 
         }
     };
-    
-    if received_hash != expected_hash || &data[56..58] != b"\r\n" {
-        println!("WARN: Handshake failed: invalid password. Fallback.");
-        return fallback_proxy(tls_stream, data.to_vec()).await;
+    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // Length mismatch is fine to leak here: both sides are always 56 bytes
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+    if !constant_time_eq(received_hash.as_bytes(), expected_hash.as_bytes()) || &data[56..58] != b"\r\n" {
+        println!("INFO: Invalid password or framing. Routing to fallback.");
+        return fallback_proxy(tls_stream, initial_buf).await; 
     }
     
-    // Parse Trojan request
+    // ==========================================
+    // AUTHENTICATION SUCCESSFUL
+    // ==========================================
+    
     let request_data = &data[58..];
     if request_data.is_empty() {
-        println!("WARN: Handshake failed: no request data. Fallback.");
-        return fallback_proxy(tls_stream, data.to_vec()).await;
+        println!("INFO: Authenticated but missing payload. Proxying to fallback with EMPTY buffer to prevent password leak.");
+        return fallback_proxy(tls_stream, Vec::new()).await;
     }
     
     let cmd = request_data[0];
@@ -445,24 +546,24 @@ async fn handle_client(stream: TcpStream, tls_acceptor: TlsAcceptor) -> Result<(
     let addr = match parse_address(request_data, &mut cursor) {
         Ok(addr) => addr,
         Err(e) => {
-            println!("WARN: Invalid address in request: {}. Fallback.", e);
-            return fallback_proxy(tls_stream, data.to_vec()).await;
+            println!("WARN: Invalid address in request: {}. Routing to fallback without password.", e);
+            return fallback_proxy(tls_stream, request_data.to_vec()).await; 
         }
     };
     
     // Parse port
     if request_data.len() < cursor + 2 {
-        println!("WARN: Insufficient data for port. Fallback.");
-        return fallback_proxy(tls_stream, data.to_vec()).await;
+        println!("WARN: Insufficient data for port. Routing to fallback without password.");
+        return fallback_proxy(tls_stream, request_data.to_vec()).await;
     }
     
     let port = u16::from_be_bytes([request_data[cursor], request_data[cursor + 1]]);
     cursor += 2;
     
-    // Check CRLF
+    // Check CRLF before the payload
     if request_data.len() < cursor + 2 || &request_data[cursor..cursor + 2] != b"\r\n" {
-        println!("WARN: Malformed request: missing CRLF. Fallback.");
-        return fallback_proxy(tls_stream, data.to_vec()).await;
+        println!("WARN: Malformed request: missing CRLF. Routing to fallback without password.");
+        return fallback_proxy(tls_stream, request_data.to_vec()).await;
     }
     cursor += 2;
     
@@ -472,7 +573,7 @@ async fn handle_client(stream: TcpStream, tls_acceptor: TlsAcceptor) -> Result<(
     match cmd {
         0x01 => {
             // TCP CONNECT
-            println!("INFO: TCP CONNECT request to {}:{}", addr, port);
+            //println!("INFO: TCP CONNECT request to {}:{}", addr, port);
             handle_tcp_connect(tls_stream, addr, port, payload).await
         }
         0x03 => {
@@ -481,12 +582,11 @@ async fn handle_client(stream: TcpStream, tls_acceptor: TlsAcceptor) -> Result<(
             handle_udp_associate(tls_stream, payload).await
         }
         _ => {
-            println!("WARN: Unsupported command: {}. Fallback.", cmd);
-            fallback_proxy(tls_stream, data.to_vec()).await
+            println!("WARN: Unsupported command: {}. Routing to fallback without password.", cmd);
+            fallback_proxy(tls_stream, request_data.to_vec()).await
         }
     }
 }
-
 fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
     // Load certificate and key files
     let cert_file = match std::fs::File::open(CERT_FILE) {
@@ -533,16 +633,25 @@ fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
     }
     
     // Build TLS config
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, keys[0].clone())?;
-    
+        // Add this: advertise h2 and http/1.1, matching what real Nginx does
+    config.alpn_protocols = vec![
+        b"h2".to_vec(),
+        b"http/1.1".to_vec(),
+    ];
     Ok(config)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let password = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("Usage: trojan-server <password>");
+        std::process::exit(1);
+    });
+    init_password_hash(&password);
     // Load TLS configuration
     let tls_config = match load_tls_config() {
         Ok(config) => config,
@@ -567,20 +676,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     println!("INFO: Trojan Proxy with UDP support listening on {} with TLS", listen_addr);
-    
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let acceptor = tls_acceptor.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, acceptor).await {
-                        println!("ERROR: Client handling error: {}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                println!("ERROR: Failed to accept connection: {}", e);
-            }
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+loop {
+    // 1. Accept the connection FIRST
+    let (stream, peer_addr) = match listener.accept().await {
+        Ok(res) => res,
+        Err(e) => {
+            println!("ERROR: Failed to accept connection: {}", e);
+            continue;
         }
-    }
+    };
+
+    let acceptor = tls_acceptor.clone();
+    let sem = Arc::clone(&semaphore);
+    
+    tokio::spawn(async move {
+        // 2. Then acquire the permit
+        let _permit = match sem.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                println!("WARN: Connection limit reached, dropping connection from {}.", peer_addr);
+                return;
+            }
+        };
+        
+        // 3. Pass the stream to the handler
+        if let Err(e) = handle_client(stream, acceptor).await {
+            println!("ERROR: Client handling error: {}", e);
+        }
+    });
+}
 }
