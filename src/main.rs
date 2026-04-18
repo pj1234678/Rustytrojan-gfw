@@ -1,11 +1,12 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
+use tokio::time::{sleep, timeout, Instant};
 use tokio_rustls::{rustls, TlsAcceptor};
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile;
@@ -22,11 +23,41 @@ const KEY_FILE: &str = "server.key";
 const BUFFER_SIZE: usize = 4096;
 // ---------------------
 
+static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
+
+fn init_password_hash(password: &str) {
+    PASSWORD_HASH.get_or_init(|| sha224_hex(password));
+}
+
+fn get_password_hash() -> &'static str {
+    PASSWORD_HASH.get().expect("Password hash not initialized")
+}
 
 fn sha224_hex(s: &str) -> String {
     let mut hasher = Sha224::new();
     hasher.update(s.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn is_private_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()           // 127.0.0.0/8
+            || ipv4.is_private()         // 10/8, 172.16/12, 192.168/16
+            || ipv4.is_link_local()      // 169.254.0.0/16
+            || ipv4.is_broadcast()       // 255.255.255.255
+            || ipv4.is_documentation()   // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+            || ipv4.is_unspecified()     // 0.0.0.0
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()           // ::1
+            || ipv6.is_unspecified()     // ::
+            // ULA: fc00::/7
+            || (ipv6.segments()[0] & 0xfe00) == 0xfc00
+            // Link-local: fe80::/10
+            || (ipv6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 fn parse_address(data: &[u8], cursor: &mut usize) -> Result<String, String> {
@@ -147,8 +178,29 @@ fn encode_udp_response(addr: &str, port: u16, payload: &[u8]) -> Result<Vec<u8>,
     
     Ok(response)
 }
-use std::collections::HashSet;
-use std::sync::RwLock;
+
+// Accurately calculates if we have received the exact amount of bytes for a full header
+fn is_trojan_header_complete(buf: &[u8]) -> bool {
+    // We need at least: hash(56) + \r\n(2) + cmd(1) + atyp(1) = 60 bytes
+    if buf.len() < 60 { return false; } 
+    
+    let atyp = buf[59];
+    let addr_len = match atyp {
+        0x01 => 4, // IPv4 length
+        0x03 => {  // Domain length is dynamic
+            if buf.len() < 61 { return false; }
+            1 + buf[60] as usize // 1 byte for the length indicator + the actual domain string
+        },
+        0x04 => 16, // IPv6 length
+        _ => return false, // Invalid type, return false so the parser routes to fallback later
+    };
+    
+    // Total expected = 58 (Hash+CRLF) + 2 (Cmd+Atyp) + addr_len + 2 (Port) + 2 (Final CRLF)
+    let total_expected_len = 58 + 2 + addr_len + 4;
+    
+    buf.len() >= total_expected_len
+}
+
 async fn handle_udp_associate(
     mut client_stream: tokio_rustls::server::TlsStream<TcpStream>,
     initial_payload: Vec<u8>,
@@ -194,11 +246,16 @@ async fn handle_udp_associate(
                         match tokio::net::lookup_host(&dest_full_addr).await {
                             Ok(mut addrs) => {
                                 if let Some(target_addr) = addrs.next() {
-                                    // Trust this target IP to reply to us later
-                                    allowed_peers.insert(target_addr);
-                                    
-                                    if let Err(e) = udp_socket.send_to(&payload, target_addr).await {
-                                        println!("WARN: Failed to forward UDP to {}: {}", target_addr, e);
+                                    // --- SEC FIX: UDP SSRF Prevention ---
+                                    if is_private_address(target_addr.ip()) {
+                                        println!("WARN: UDP SSRF block: {} resolved to private address {}", dest_full_addr, target_addr.ip());
+                                    } else {
+                                        // Trust this target IP to reply to us later
+                                        allowed_peers.insert(target_addr);
+                                        
+                                        if let Err(e) = udp_socket.send_to(&payload, target_addr).await {
+                                            println!("WARN: Failed to forward UDP to {}: {}", target_addr, e);
+                                        }
                                     }
                                 }
                             }
@@ -260,28 +317,6 @@ async fn handle_udp_associate(
 
     println!("INFO: Closing UDP tunnel cleanly.");
     Ok(())
-}
-use tokio::time::{sleep, Instant};
-
-fn is_private_address(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => {
-            ipv4.is_loopback()           // 127.0.0.0/8
-            || ipv4.is_private()         // 10/8, 172.16/12, 192.168/16
-            || ipv4.is_link_local()      // 169.254.0.0/16
-            || ipv4.is_broadcast()       // 255.255.255.255
-            || ipv4.is_documentation()   // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-            || ipv4.is_unspecified()     // 0.0.0.0
-        }
-        IpAddr::V6(ipv6) => {
-            ipv6.is_loopback()           // ::1
-            || ipv6.is_unspecified()     // ::
-            // ULA: fc00::/7
-            || (ipv6.segments()[0] & 0xfe00) == 0xfc00
-            // Link-local: fe80::/10
-            || (ipv6.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
 }
 
 async fn handle_tcp_connect(
@@ -370,7 +405,7 @@ async fn handle_tcp_connect(
 
     Ok(())
 }
-use chrono::Utc;
+
 async fn fallback_proxy(
     client_stream: tokio_rustls::server::TlsStream<TcpStream>,
     initial_data: Vec<u8>,
@@ -409,6 +444,7 @@ async fn fallback_proxy(
 
     Ok(())
 }
+
 async fn pipe_data<R, W>(mut reader: R, mut writer: W) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -416,13 +452,14 @@ where
 {
     let mut buffer = [0u8; BUFFER_SIZE];
     loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => break, // EOF
-            Ok(n) => {
+        // --- SEC FIX: 5-Minute Idle Timeout for TCP Connections ---
+        match timeout(Duration::from_secs(300), reader.read(&mut buffer)).await {
+            Ok(Ok(0)) => break, // Clean EOF
+            Ok(Ok(n)) => {
                 writer.write_all(&buffer[..n]).await?;
             }
-            Err(e) => {
-                // Ignore common connection errors
+            Ok(Err(e)) => {
+                // Ignore common connection resets/broken pipes
                 if e.kind() == std::io::ErrorKind::ConnectionReset
                     || e.kind() == std::io::ErrorKind::BrokenPipe
                 {
@@ -430,32 +467,24 @@ where
                 }
                 return Err(Box::new(e));
             }
+            Err(_) => {
+                // Timeout occurred (No data transferred for 300 seconds)
+                println!("INFO: TCP connection closed due to 5-minute idle timeout.");
+                break; 
+            }
         }
     }
     Ok(())
 }
-use tokio::time::timeout;
-use std::sync::OnceLock;
-static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
-
-fn init_password_hash(password: &str) {
-    PASSWORD_HASH.get_or_init(|| sha224_hex(password));
-}
-
-fn get_password_hash() -> &'static str {
-    PASSWORD_HASH.get().expect("Password hash not initialized")
-}// ---------------------------------------------------------
 
 async fn handle_client(
     stream: TcpStream, 
-    tls_acceptor: TlsAcceptor
+    tls_acceptor: TlsAcceptor,
+    semaphore: Arc<Semaphore>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_addr = stream.peer_addr()?;
-    //println!("INFO: New connection from {}", client_addr);
     
     // --- SEC FIX: TLS Handshake Timeout (Slowloris Protection) ---
-    // Unauthenticated clients can no longer hold open connections indefinitely 
-    // simply by withholding the TLS ClientHello packet.
     let mut tls_stream = match timeout(Duration::from_secs(10), tls_acceptor.accept(stream)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
@@ -468,6 +497,15 @@ async fn handle_client(
         }
     };
     // -------------------------------------------------------------
+
+    // --- SEC FIX: Zombie Connection Pool Exhaustion ---
+    let _permit = match semaphore.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            println!("WARN: Connection limit reached, dropping connection from {}.", client_addr);
+            return Ok(());
+        }
+    };
     
     let mut initial_buf = Vec::new();
     let mut temp_buf = [0u8; BUFFER_SIZE];
@@ -481,20 +519,32 @@ async fn handle_client(
             }
             initial_buf.extend_from_slice(&temp_buf[..n]);
             
-            // Condition 1: We have enough data to evaluate a Trojan handshake
-            if initial_buf.len() >= 58 {
-                break;
+            // Condition 1: Deterministic Trojan Header Validation
+            if is_trojan_header_complete(&initial_buf) {
+                break; // Full header received without ambiguity!
+            } 
+            // --- SEC FIX: Greedy CRLF Hex Collision ---
+            // Detect HTTP probes safely without breaking legitimate Hex payloads.
+            else if initial_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                // A valid Trojan request must have \r\n exactly at bytes 56-57.
+                let is_valid_prefix = initial_buf.len() >= 58 && &initial_buf[56..58] == b"\r\n";
+                
+                // If it doesn't match a Trojan prefix, it's an HTTP probe. Break out.
+                // If it DOES match, the \r\n\r\n is part of a binary IP/Port payload! Keep reading.
+                if !is_valid_prefix {
+                    break;
+                }
             }
-            
-            // Condition 2: Early HTTP Probe Detection
-            if initial_buf.windows(4).any(|window| window == b"\r\n\r\n") {
+
+            // Condition 3: Security safeguard against memory exhaustion.
+            if initial_buf.len() > 4096 {
                 break;
             }
         }
         Ok::<_, std::io::Error>(())
     }).await;
 
-    // Handle timeout, connection errors, or explicitly invalid Trojan lengths/HTTP requests
+    // Handle timeout, connection errors, or explicitly invalid HTTP requests/buffer lengths
     if read_result.is_err() || initial_buf.len() < 58 {
         println!("INFO: Routing suspicious probe or HTTP request to fallback.");
         return fallback_proxy(tls_stream, initial_buf).await; 
@@ -502,9 +552,8 @@ async fn handle_client(
     
     let data = &initial_buf;
     
-    // --- SEC FIX: Use the globally cached hash ---
+    // Use the globally cached hash
     let expected_hash = get_password_hash();
-    // ---------------------------------------------
 
     let received_hash = match std::str::from_utf8(&data[..56]) {
         Ok(hash) => hash,
@@ -513,17 +562,19 @@ async fn handle_client(
             return fallback_proxy(tls_stream, initial_buf).await; 
         }
     };
+
     fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Length mismatch is fine to leak here: both sides are always 56 bytes
-    if a.len() != b.len() {
-        return false;
+        // Length mismatch is fine to leak here: both sides are always 56 bytes
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut result: u8 = 0;
+        for (x, y) in a.iter().zip(b.iter()) {
+            result |= x ^ y;
+        }
+        result == 0
     }
-    let mut result: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
+
     if !constant_time_eq(received_hash.as_bytes(), expected_hash.as_bytes()) || &data[56..58] != b"\r\n" {
         println!("INFO: Invalid password or framing. Routing to fallback.");
         return fallback_proxy(tls_stream, initial_buf).await; 
@@ -560,9 +611,9 @@ async fn handle_client(
     let port = u16::from_be_bytes([request_data[cursor], request_data[cursor + 1]]);
     cursor += 2;
     
-    // Check CRLF before the payload
+    // Check final CRLF before the payload
     if request_data.len() < cursor + 2 || &request_data[cursor..cursor + 2] != b"\r\n" {
-        println!("WARN: Malformed request: missing CRLF. Routing to fallback without password.");
+        println!("WARN: Malformed request: missing final CRLF. Routing to fallback without password.");
         return fallback_proxy(tls_stream, request_data.to_vec()).await;
     }
     cursor += 2;
@@ -573,7 +624,6 @@ async fn handle_client(
     match cmd {
         0x01 => {
             // TCP CONNECT
-            //println!("INFO: TCP CONNECT request to {}:{}", addr, port);
             handle_tcp_connect(tls_stream, addr, port, payload).await
         }
         0x03 => {
@@ -587,6 +637,7 @@ async fn handle_client(
         }
     }
 }
+
 fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
     // Load certificate and key files
     let cert_file = match std::fs::File::open(CERT_FILE) {
@@ -677,33 +728,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("INFO: Trojan Proxy with UDP support listening on {} with TLS", listen_addr);
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-loop {
-    // 1. Accept the connection FIRST
-    let (stream, peer_addr) = match listener.accept().await {
-        Ok(res) => res,
-        Err(e) => {
-            println!("ERROR: Failed to accept connection: {}", e);
-            continue;
-        }
-    };
-
-    let acceptor = tls_acceptor.clone();
-    let sem = Arc::clone(&semaphore);
     
-    tokio::spawn(async move {
-        // 2. Then acquire the permit
-        let _permit = match sem.try_acquire() {
-            Ok(permit) => permit,
-            Err(_) => {
-                println!("WARN: Connection limit reached, dropping connection from {}.", peer_addr);
-                return;
+    loop {
+        // 1. Accept the connection FIRST
+        let (stream, _peer_addr) = match listener.accept().await {
+            Ok(res) => res,
+            Err(e) => {
+                println!("ERROR: Failed to accept connection: {}", e);
+                continue;
             }
         };
+
+        let acceptor = tls_acceptor.clone();
+        let sem = Arc::clone(&semaphore);
         
-        // 3. Pass the stream to the handler
-        if let Err(e) = handle_client(stream, acceptor).await {
-            println!("ERROR: Client handling error: {}", e);
-        }
-    });
-}
+        tokio::spawn(async move {
+            // 2 & 3. Pass the stream and semaphore to the handler
+            if let Err(e) = handle_client(stream, acceptor, sem).await {
+                println!("ERROR: Client handling error: {}", e);
+            }
+        });
+    }
 }
